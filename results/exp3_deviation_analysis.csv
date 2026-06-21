@@ -1,0 +1,9 @@
+target_firm,target_firm_role,deviation,zk_shapley_payment,proportional_payment
+firm_1,smallest_data,honest,0.10967140476036177,0.03115280125346198
+firm_1,smallest_data,free_ride,-0.6813028673081929,0.036453043097942166
+firm_1,smallest_data,data_inflation,,0.08840517550862755
+firm_1,smallest_data,noise_injection,-0.08235247277105216,0.03117322435770444
+firm_9,largest_data,honest,0.10037632024461526,0.18659229917438167
+firm_9,largest_data,free_ride,-0.4592883721013504,0.598424402935449
+firm_9,largest_data,data_inflation,,0.4170083386072841
+firm_9,largest_data,noise_injection,-0.10058573329413618,0.18005460216014474

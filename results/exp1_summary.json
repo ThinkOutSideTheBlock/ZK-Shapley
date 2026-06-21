@@ -1,0 +1,12 @@
+{
+  "n_firms": 10,
+  "rmse_no_sharing": 3.457233507801865,
+  "rmse_grand_coalition": 2.367209972277086,
+  "v_N_total_surplus": 1.0900235355247792,
+  "efficiency_axiom_passes": true,
+  "efficiency_axiom_gap": 0.0,
+  "n_characteristic_function_evaluations": 1024,
+  "commitments_all_verified": true,
+  "mean_zk_proving_time_sec": 0.05,
+  "mean_zk_verification_time_sec": 5e-05
+}
