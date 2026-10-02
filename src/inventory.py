@@ -1,211 +1,181 @@
 """
-Multi-echelon serial supply chain simulator under periodic-review base-stock
-((R,S) / order-up-to) policies, parameterized by a forecasting model's
-out-of-sample mean and residual-std estimates.
+Multi-echelon base-stock inventory simulator: converts forecast quality into
+an OPERATIONAL, dollar-denominated payoff.
 
-This is the module that closes the loop between mechanism design (which
-determines what forecasting model a firm ends up with, as a function of which
-coalition's federated statistics it had access to) and supply chain economic
-outcomes (holding cost, backorder cost, fill rate, bullwhip ratio) -- i.e. it
-is what makes this a *supply chain optimization* paper and not only a
-mechanism-design paper.
+Policy: order-up-to (base-stock), periodic review, fixed lead time L per
+echelon. Base-stock level (standard discrete-time formula):
 
-Model (standard multi-echelon inventory theory; Clark & Scarf, 1960; Zipkin,
-2000, Ch. 9 for the echelon base-stock formulation):
+    S = mu * (L + 1) + z * sigma * sqrt(L + 1)
 
-  - Serial chain of E echelons. Echelon 1 (most downstream) faces exogenous
-    customer demand D(t). Echelon e (e > 1) faces "demand" equal to echelon
-    (e-1)'s realized order quantity in the same period (standard serial-chain
-    propagation).
-  - Each echelon e has lead time L_e (periods) and follows a base-stock
-    (order-up-to) policy with review period r_period: in each review period,
-    echelon e places an order to bring its ECHELON inventory position
-    (on-hand + on-order - backorders, summed over itself and all downstream
-    echelons -- the Clark-Scarf "echelon stock" definition) up to a target
-    base-stock level
+covering lead time plus the current review period. See Zipkin (2000).
 
-        S_e = (r_period + L_e) * mu_hat_e + z_e * sigma_hat_e * sqrt(r_period + L_e)
-
-    where mu_hat_e, sigma_hat_e are the forecasting model's estimated mean and
-    residual standard deviation of one-period demand at echelon e, and
-    z_e = Phi^{-1}(alpha_e) is the safety factor for target service level
-    alpha_e (standard newsvendor-style safety stock formula under a Normal
-    lead-time-demand approximation).
-  - Holding cost h_e per unit of on-hand inventory per period; backorder
-    penalty cost p_e per unit of unmet demand per period (standard linear
-    cost structure used throughout the inventory literature).
-  - Fixed ordering costs are excluded by design choice (stated explicitly):
-    base-stock/order-up-to policies are the standard simplified setting when
-    the focus is on safety-stock sizing under demand uncertainty, not on
-    joint lot-sizing; including a fixed cost K would require moving to an
-    (s, S) policy with a different (harder, non-closed-form) optimization
-    structure that is not the contribution of this paper.
+Stage 0 fixes:
+  - optional initial_on_hand for warm-start probes (Prop B″)
+  - demand floored at 0
+  - protection horizon L+1 (was L; caused chronic understocking)
 """
 from __future__ import annotations
 
 import numpy as np
 from dataclasses import dataclass
-from scipy.stats import norm
 
 
 @dataclass
 class EchelonConfig:
-    name: str
-    lead_time: int           # periods (must be >= 1; see pipeline indexing note below)
-    holding_cost: float       # cost per unit on-hand per period
-    backorder_cost: float     # cost per unit backordered per period
-    service_level: float      # target alpha in (0, 1)
-
-    def __post_init__(self):
-        if self.lead_time < 1:
-            raise ValueError(
-                f"EchelonConfig({self.name}): lead_time must be >= 1 (got {self.lead_time}); "
-                "the pipeline-delay accounting in simulate_serial_supply_chain assumes a "
-                "strictly positive lead time. Use lead_time=1 for 'next-period arrival'."
-            )
-
-    @property
-    def z(self) -> float:
-        return float(norm.ppf(self.service_level))
+    """Cost and service parameters for a single echelon in a serial supply chain."""
+    holding_cost: float
+    shortage_cost: float
+    lead_time: int
+    service_level: float = 0.95
 
 
 @dataclass
 class SimulationOutput:
-    on_hand: np.ndarray          # (E, T)
-    backorder: np.ndarray         # (E, T)
-    orders: np.ndarray            # (E, T)
-    holding_cost_series: np.ndarray   # (E, T)
-    backorder_cost_series: np.ndarray  # (E, T)
     total_cost: float
-    fill_rate: float               # downstream (echelon 0) period service level achieved
-    bullwhip_ratio: float           # Var(top-echelon orders) / Var(external demand)
+    holding_cost: float
+    shortage_cost: float
+    fill_rate: float
+    avg_inventory: float
+    avg_backorder: float
+
+
+def _service_level_to_z(service_level: float) -> float:
+    from scipy.stats import norm
+    service_level = float(np.clip(service_level, 1e-4, 1 - 1e-4))
+    return float(norm.ppf(service_level))
+
+
+def default_three_echelon_config() -> list[EchelonConfig]:
+    return [
+        EchelonConfig(holding_cost=1.0, shortage_cost=9.0,
+                      lead_time=1, service_level=0.95),
+        EchelonConfig(holding_cost=0.6, shortage_cost=0.0,
+                      lead_time=2, service_level=0.90),
+        EchelonConfig(holding_cost=0.3, shortage_cost=0.0,
+                      lead_time=3, service_level=0.90),
+    ]
+
+
+def _base_stock_level(forecast_mean: float, residual_std: float, lead_time: int, z: float) -> float:
+    """
+    Order-up-to level for discrete-time base-stock with lead time L.
+
+    Protects L+1 periods of demand (lead time + review period):
+        mu_L    = (L + 1) * forecast_mean
+        sigma_L = sqrt(L + 1) * residual_std
+        S       = mu_L + z * sigma_L
+    """
+    L_prot = max(int(lead_time), 0) + 1
+    mu_L = L_prot * max(forecast_mean, 0.0)
+    sigma_L = np.sqrt(L_prot) * max(residual_std, 1e-6)
+    return mu_L + z * sigma_L
 
 
 def simulate_serial_supply_chain(
-    external_demand: np.ndarray,
-    forecast_mean: np.ndarray,
-    forecast_resid_std: float,
+    demand_path: np.ndarray,
+    forecast_path: np.ndarray,
+    residual_std: float,
     echelons: list[EchelonConfig],
-    review_period: int = 1,
+    rng: np.random.Generator | None = None,
+    stochastic_lead_time: bool = False,
+    initial_on_hand: float | None = None,
 ) -> SimulationOutput:
-    """
-    Simulate T periods of a serial E-echelon base-stock system.
+    if stochastic_lead_time and rng is None:
+        raise ValueError(
+            "stochastic_lead_time=True requires an explicit rng for reproducible "
+            "common random numbers across coalitions."
+        )
 
-    external_demand: length-T realized demand at the most downstream echelon.
-    forecast_mean:    length-T one-step-ahead forecast of external_demand
-                       (used by ALL echelons as the basis for their own
-                       lead-time-demand estimate -- a standard simplifying
-                       assumption that demand information is shared
-                       instantaneously upstream once forecast, isolating the
-                       effect of FORECAST QUALITY, which is this paper's
-                       object of interest, from the effect of information
-                       delay, which is not).
-    forecast_resid_std: scalar estimate of one-step forecast residual std
-                       (e.g., RMSE of the federated model on its holdout set),
-                       used to size safety stock at every echelon.
-    """
-    E = len(echelons)
-    T = len(external_demand)
-    on_hand = np.zeros((E, T))
-    backorder = np.zeros((E, T))
-    orders = np.zeros((E, T))
-    holding_cost_series = np.zeros((E, T))
-    backorder_cost_series = np.zeros((E, T))
+    if rng is None:
+        rng = np.random.default_rng()
 
-    # Pipeline (in-transit) orders per echelon, represented as an array of
-    # `lead_time` slots: slot 0 = arriving THIS period (about to be received
-    # at the top of the loop below), slot lead_time-1 = just-placed order
-    # (lead_time periods from arrival). Each period: receive slot 0, shift
-    # everything down by one (np.roll left + zero the now-vacant last slot),
-    # then append the new order into the freshly-vacated last slot. This
-    # ordering guarantees an order placed at period t arrives exactly at
-    # period t + lead_time, which we verify explicitly in
-    # tests/test_inventory.py via a zero-uncertainty deterministic-demand case.
-    pipelines = [np.zeros(ech.lead_time) for ech in echelons]
+    T = len(demand_path)
+    n_ech = len(echelons)
 
-    # Initialize on-hand inventory at each echelon's base-stock target for
-    # period 0, using the period-0 forecast, to avoid a cold-start transient
-    # dominating the cost metrics (standard practice: report steady-state
-    # cost after burn-in, implemented here via warm starting).
-    init_base_stock = [
-        (review_period + ech.lead_time) * forecast_mean[0]
-        + ech.z * forecast_resid_std * np.sqrt(review_period + ech.lead_time)
-        for ech in echelons
-    ]
-    for e in range(E):
-        on_hand[e, 0] = init_base_stock[e]
+    total_holding = 0.0
+    total_shortage = 0.0
+    fulfilled = 0.0
+    total_demand = 0.0
+    inv_trace = np.zeros(n_ech)
+    backorder_trace = np.zeros(n_ech)
 
-    demand_into_echelon = np.zeros((E, T))
-    demand_into_echelon[0, :] = external_demand
+    downstream_order_stream = np.asarray(demand_path, dtype=float).copy()
 
-    for t in range(T):
-        for e in range(E):
-            # Receive any inbound pipeline order arriving this period.
-            arriving = pipelines[e][0]
-            on_hand[e, t] += arriving
-            pipelines[e] = np.roll(pipelines[e], -1)
-            pipelines[e][-1] = 0.0
+    for ech_idx, ech in enumerate(echelons):
+        z = _service_level_to_z(ech.service_level)
+        L = max(ech.lead_time, 1)
+        pipe = [0.0] * L
+        oh = float(initial_on_hand) if initial_on_hand is not None else 0.0
+        bo = 0.0
+        ech_holding, ech_shortage, ech_fulfilled, ech_demand = 0.0, 0.0, 0.0, 0.0
 
-            # This period's demand on echelon e.
-            d_t = demand_into_echelon[e, t]
+        realized_demand_here = downstream_order_stream
+        next_order_stream = np.zeros(T)
 
-            # Fulfill demand from on-hand inventory; unmet demand becomes
-            # (or adds to) backorder; backorders carry over and are
-            # prioritized first in subsequent periods (FIFO backorder clearing).
-            available = on_hand[e, t] - (backorder[e, t - 1] if t > 0 else 0.0)
-            if available >= d_t:
-                on_hand[e, t] = available - d_t
-                backorder[e, t] = 0.0
-                shipped = d_t
+        for t in range(T):
+            arriving = pipe.pop(0)
+            oh += arriving
+
+            if ech_idx == 0:
+                f_mean = float(forecast_path[t])
             else:
-                shipped = max(available, 0.0)
-                on_hand[e, t] = 0.0
-                backorder[e, t] = d_t - shipped + max(-available, 0.0)
+                if t > 0:
+                    f_mean = float(
+                        np.mean(realized_demand_here[max(0, t - 4):t]))
+                else:
+                    f_mean = float(realized_demand_here[0])
 
-            # Propagate the SHIPPED quantity upstream as next echelon's demand
-            # (standard serial-chain order propagation: what echelon e ships
-            # downstream becomes what echelon e orders from echelon e+1, under
-            # a base-stock policy this equals the period's order quantity).
-
-            # Base-stock order-up-to calculation using the shared forecast.
-            mu_hat = forecast_mean[t]
-            target = (
-                (review_period + echelons[e].lead_time) * mu_hat
-                + echelons[e].z * forecast_resid_std * np.sqrt(review_period + echelons[e].lead_time)
+            target = _base_stock_level(
+                f_mean,
+                residual_std if ech_idx == 0 else max(residual_std, 1e-6),
+                L,
+                z,
             )
-            echelon_position = on_hand[e, t] - backorder[e, t] + pipelines[e].sum()
-            order_qty = max(target - echelon_position, 0.0)
-            orders[e, t] = order_qty
 
-            if e + 1 < E:
-                if t + 1 < T:
-                    demand_into_echelon[e + 1, t] = order_qty  # immediate propagation (info, not material)
-            # Schedule physical arrival after lead_time periods: place the
-            # order in the last pipeline slot (size == lead_time exactly, so
-            # this slot represents "lead_time periods until arrival"; it will
-            # reach slot 0 -- and be received -- after exactly lead_time
-            # subsequent roll operations, i.e. at period t + lead_time).
-            pipelines[e][-1] += order_qty
+            in_pipeline = sum(pipe)
+            order_qty = max(target - (oh - bo) - in_pipeline, 0.0)
+            pipe.append(order_qty)
+            next_order_stream[t] = order_qty
 
-            holding_cost_series[e, t] = echelons[e].holding_cost * max(on_hand[e, t], 0.0)
-            backorder_cost_series[e, t] = echelons[e].backorder_cost * max(backorder[e, t], 0.0)
+            d_t = max(float(realized_demand_here[t]), 0.0)
+            ech_demand += d_t
+            available = oh - bo
+            if available >= d_t:
+                oh -= d_t
+                served = d_t
+            else:
+                served = max(available, 0.0)
+                shortfall = d_t - served
+                bo += shortfall
+                oh = max(oh - served, 0.0)
+            ech_fulfilled += served
 
-    total_cost = float(holding_cost_series.sum() + backorder_cost_series.sum())
-    fill_rate = float(1.0 - (backorder[0] > 0).sum() / T)
-    top_orders = orders[-1]
-    bullwhip_ratio = float(np.var(top_orders) / np.var(external_demand)) if np.var(external_demand) > 0 else float("nan")
+            backlog_clear = min(bo, oh)
+            oh -= backlog_clear
+            bo -= backlog_clear
+
+            ech_holding += ech.holding_cost * max(oh, 0.0)
+            ech_shortage += ech.shortage_cost * max(bo, 0.0)
+            inv_trace[ech_idx] += max(oh, 0.0)
+            backorder_trace[ech_idx] += max(bo, 0.0)
+
+        total_holding += ech_holding
+        total_shortage += ech_shortage
+        if ech_idx == 0:
+            fulfilled += ech_fulfilled
+            total_demand += ech_demand
+        downstream_order_stream = next_order_stream
+
+    total_cost = total_holding + total_shortage
+    fill_rate = fulfilled / total_demand if total_demand > 0 else 1.0
+    avg_inventory = float(np.sum(inv_trace) / (n_ech * T))
+    avg_backorder = float(np.sum(backorder_trace) / (n_ech * T))
 
     return SimulationOutput(
-        on_hand=on_hand, backorder=backorder, orders=orders,
-        holding_cost_series=holding_cost_series, backorder_cost_series=backorder_cost_series,
-        total_cost=total_cost, fill_rate=fill_rate, bullwhip_ratio=bullwhip_ratio,
+        total_cost=float(total_cost),
+        holding_cost=float(total_holding),
+        shortage_cost=float(total_shortage),
+        fill_rate=float(fill_rate),
+        avg_inventory=avg_inventory,
+        avg_backorder=avg_backorder,
     )
-
-
-def default_three_echelon_config(service_level: float = 0.95) -> list[EchelonConfig]:
-    """Retailer -> Distributor -> Manufacturer, increasing lead time upstream (standard assumption)."""
-    return [
-        EchelonConfig(name="retailer", lead_time=1, holding_cost=1.0, backorder_cost=8.0, service_level=service_level),
-        EchelonConfig(name="distributor", lead_time=2, holding_cost=0.6, backorder_cost=4.0, service_level=service_level),
-        EchelonConfig(name="manufacturer", lead_time=3, holding_cost=0.3, backorder_cost=2.0, service_level=service_level),
-    ]

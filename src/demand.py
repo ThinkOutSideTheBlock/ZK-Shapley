@@ -22,6 +22,13 @@ if the data-generating process satisfies two properties simultaneously:
      "highest signal quality" are never confounded within a replication.
      This is required by plan Section F.2's experimental-factors table.
 
+  3. Profile "fixed" (P2 / oracle benchmark): n_i, gamma_i, sigma_i are
+     deterministic functions of firm index i (no shuffle). Firm identity is
+     stable across structural seeds so population residual rankings can be
+     compared; only realizations (beta_true, z, X, eps) change with seed.
+     Stronger ladders (n: 0.40–2.40, gamma: 0.15–1.40, sigma geometric
+     0.40·2^i) used for nested-T oracle recovery attempts.
+
 Demand-generating process (firm i, period t):
 
     y_{i,t} = x_{i,t}' beta_true + gamma_i * z_t + eps_{i,t},   eps_{i,t} ~ N(0, sigma_i^2)
@@ -50,10 +57,12 @@ class DemandSimulationConfig:
     n_features: int = 8
     shared_factor_correlation: float = 0.5
     base_n_obs: int = 300
-    # "balanced" | "moderate" | "severe"
+    # "balanced" | "moderate" | "severe" | "fixed"
     n_obs_heterogeneity: str = "moderate"
-    # "homogeneous" | "one_high_quality" | "one_noisy"
+    # "homogeneous" | "one_high_quality" | "one_noisy" | "fixed"
     signal_quality_profile: str = "homogeneous"
+    # "random" | "fixed"  (idiosyncratic noise)
+    noise_profile: str = "random"
     base_noise_std: float = 1.0
     beta_scale: float = 1.0
     seed: int = 0
@@ -78,45 +87,94 @@ class DemandSimulationResult:
     config: DemandSimulationConfig
 
 
-def _draw_n_obs(rng: np.random.Generator, n_firms: int, base_n_obs: int, profile: str) -> np.ndarray:
-    """Draw per-firm sample counts under a heterogeneity profile, then shuffle across firm slots."""
+def _draw_n_obs(
+    rng: np.random.Generator,
+    n_firms: int,
+    base_n_obs: int,
+    profile: str,
+) -> np.ndarray:
+    """
+    Per-firm sample counts.
+
+    "fixed": deterministic ladder by firm index (no shuffle).
+    Other profiles: random draws then shuffle (decoupled experimental factors).
+    """
     if profile == "balanced":
         counts = np.full(n_firms, base_n_obs, dtype=float)
     elif profile == "moderate":
         counts = base_n_obs * rng.uniform(0.6, 1.6, size=n_firms)
     elif profile == "severe":
         counts = base_n_obs * rng.uniform(0.15, 3.0, size=n_firms)
+    elif profile == "fixed":
+        # firm_0 smallest ... firm_{n-1} largest; stronger span for oracle recovery
+        factors = np.linspace(0.40, 2.40, n_firms)
+        counts = base_n_obs * factors
     else:
         raise ValueError(f"Unknown n_obs_heterogeneity profile '{profile}'.")
     counts = np.clip(np.round(counts).astype(int), 30, None)
-    rng.shuffle(counts)
+    if profile != "fixed":
+        rng.shuffle(counts)
     return counts
 
 
-def _draw_gammas(rng: np.random.Generator, n_firms: int, profile: str) -> np.ndarray:
-    """Draw per-firm common-factor loadings (signal-quality knob), independently shuffled."""
+def _draw_gammas(
+    rng: np.random.Generator,
+    n_firms: int,
+    profile: str,
+) -> np.ndarray:
+    """
+    Per-firm common-factor loadings (signal-quality knob).
+
+    "fixed": increasing loadings by firm index (stable identity).
+    """
     if profile == "homogeneous":
         gammas = np.full(n_firms, 0.6, dtype=float)
     elif profile == "one_high_quality":
         gammas = np.full(n_firms, 0.4, dtype=float)
         gammas[rng.integers(0, n_firms)] = 1.2
+        rng.shuffle(gammas)
     elif profile == "one_noisy":
         gammas = np.full(n_firms, 0.6, dtype=float)
         gammas[rng.integers(0, n_firms)] = 0.1
+        rng.shuffle(gammas)
+    elif profile == "fixed":
+        # firm_0 low loading ... firm_{n-1} high loading (stronger span)
+        gammas = np.linspace(0.15, 1.40, n_firms)
     else:
         raise ValueError(f"Unknown signal_quality_profile '{profile}'.")
-    rng.shuffle(gammas)
     return gammas
 
 
-def _draw_sigmas(rng: np.random.Generator, n_firms: int, base_noise_std: float) -> np.ndarray:
-    """Idiosyncratic noise stds, independently drawn/shuffled (decoupled from n_obs, gamma)."""
-    sigmas = base_noise_std * rng.uniform(0.7, 1.5, size=n_firms)
-    rng.shuffle(sigmas)
+def _draw_sigmas(
+    rng: np.random.Generator,
+    n_firms: int,
+    base_noise_std: float,
+    profile: str = "random",
+) -> np.ndarray:
+    """
+    Idiosyncratic noise stds.
+
+    "fixed": geometric noise ladder by firm index (stable; not collinear with
+    gamma ladder). n=4 → factors 0.40, 0.80, 1.60, 3.20.
+    """
+    if profile == "fixed":
+        factors = np.array(
+            [0.40 * (2.0 ** i) for i in range(n_firms)], dtype=float
+        )
+        sigmas = base_noise_std * factors
+    elif profile == "random":
+        sigmas = base_noise_std * rng.uniform(0.7, 1.5, size=n_firms)
+        rng.shuffle(sigmas)
+    else:
+        raise ValueError(f"Unknown noise_profile '{profile}'.")
     return sigmas
 
 
-def _generate_common_factor(rng: np.random.Generator, n_periods: int, correlation: float) -> np.ndarray:
+def _generate_common_factor(
+    rng: np.random.Generator,
+    n_periods: int,
+    correlation: float,
+) -> np.ndarray:
     """AR(1) common latent demand-shock path, standardized to unit variance."""
     phi = np.clip(correlation, 0.0, 0.98)
     z = np.zeros(n_periods)
@@ -127,7 +185,11 @@ def _generate_common_factor(rng: np.random.Generator, n_periods: int, correlatio
     return (z - z.mean()) / (z.std() + 1e-12)
 
 
-def _build_feature_matrix(rng: np.random.Generator, n_periods: int, n_features: int) -> np.ndarray:
+def _build_feature_matrix(
+    rng: np.random.Generator,
+    n_periods: int,
+    n_features: int,
+) -> np.ndarray:
     """
     Firm i's own exogenous covariate matrix: intercept, seasonal Fourier terms,
     then idiosyncratic AR(1) regressors filling remaining columns. Kept
@@ -168,10 +230,23 @@ def generate_multi_firm_demand(config: DemandSimulationConfig) -> DemandSimulati
     beta_true[0] = config.beta_scale * 5.0
 
     z = _generate_common_factor(rng, T, config.shared_factor_correlation)
-    n_obs_vec = _draw_n_obs(rng, n, config.base_n_obs,
-                            config.n_obs_heterogeneity)
-    gamma_vec = _draw_gammas(rng, n, config.signal_quality_profile)
-    sigma_vec = _draw_sigmas(rng, n, config.base_noise_std)
+
+    # When any axis is "fixed", use fixed ladders for all three so firm identity
+    # is fully stable (required for MC oracle Kendall W across structural seeds).
+    use_fixed = (
+        config.n_obs_heterogeneity == "fixed"
+        or config.signal_quality_profile == "fixed"
+        or getattr(config, "noise_profile", "random") == "fixed"
+    )
+    n_obs_profile = "fixed" if use_fixed else config.n_obs_heterogeneity
+    gamma_profile = "fixed" if use_fixed else config.signal_quality_profile
+    noise_profile = "fixed" if use_fixed else getattr(
+        config, "noise_profile", "random"
+    )
+
+    n_obs_vec = _draw_n_obs(rng, n, config.base_n_obs, n_obs_profile)
+    gamma_vec = _draw_gammas(rng, n, gamma_profile)
+    sigma_vec = _draw_sigmas(rng, n, config.base_noise_std, noise_profile)
 
     firms: dict[str, FirmRawSeries] = {}
     for i in range(n):
@@ -186,7 +261,14 @@ def generate_multi_firm_demand(config: DemandSimulationConfig) -> DemandSimulati
         y_i = np.maximum(mean_demand + eps, 0.0)
 
         firms[name] = FirmRawSeries(
-            name=name, X=X_i, y=y_i, gamma=float(gamma_vec[i]), sigma=float(sigma_vec[i]), n_obs=n_obs_i
+            name=name,
+            X=X_i,
+            y=y_i,
+            gamma=float(gamma_vec[i]),
+            sigma=float(sigma_vec[i]),
+            n_obs=n_obs_i,
         )
 
-    return DemandSimulationResult(firms=firms, beta_true=beta_true, z=z, config=config)
+    return DemandSimulationResult(
+        firms=firms, beta_true=beta_true, z=z, config=config
+    )

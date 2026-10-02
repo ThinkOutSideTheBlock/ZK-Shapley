@@ -1,0 +1,24 @@
+Source: results/stage2_cost_n_sweep/results.csv
+Rows: 480
+
+Cell means (descriptive only):
+    cell     kappa  rho_mean  rho_std  n_obs
+ cost_k1  1.000000  1.000000 0.000000    120
+ cost_k2  2.733333  0.881071 0.184959    120
+ cost_k5  8.666667  0.731190 0.238669    120
+cost_k10 20.500000  0.645159 0.312393    120
+
+=== Within-seed Spearman(kappa, rho) CONDITIONAL ON n ===
+n=4: mean r=-0.8076, median r=-0.8944, frac r<0=0.969 (31/32), sign-test p=1.537e-08, n_units=40
+n=6: mean r=-0.9330, median r=-0.9487, frac r<0=1.000 (38/38), sign-test p=7.276e-12, n_units=40
+n=8: mean r=-0.9478, median r=-0.9487, frac r<0=1.000 (40/40), sign-test p=1.819e-12, n_units=40
+All seed×n units: mean r=-0.9019, frac r<0=0.991 (109/110), sign-test p=1.710e-31
+
+HEADLINE: use frac r<0 and sign-test on seed×n units; do not cite pooled row-count Spearman p-values.
+
+=== Within-seed Spearman pooling n (DESCRIPTIVE; may mix n and kappa) ===
+mean r=-0.7216, median r=-0.7090, frac r<0=1.000 (40/40), sign-test p=1.819e-12, n_seeds=40
+
+=== Pooled seed×cell Spearman (NOT for significance claims) ===
+N_rows=480, r=-0.6936, naive_p=4.2082e-70
+Dependent across cells sharing a seed; do not report naive_p in the paper.

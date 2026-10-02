@@ -1,0 +1,35 @@
+{
+  "param_grid": {
+    "n_firms": [
+      4
+    ],
+    "shared_factor_correlation": [
+      0.6
+    ],
+    "cb_over_ch": [
+      1.0,
+      9.0
+    ],
+    "n_periods": [
+      400
+    ],
+    "n_features": [
+      5
+    ],
+    "n_obs_heterogeneity": [
+      "moderate"
+    ],
+    "ridge_lambda": [
+      1.0
+    ]
+  },
+  "n_seeds": 20,
+  "master_seed": 42,
+  "n_configs": 2,
+  "n_runs_attempted": 40,
+  "n_rows": 880,
+  "wall_time_seconds": 2.2387040739999975,
+  "git_sha": "da082775c3b98c655677e62e3c29256f941e9bb5",
+  "config_hash": "017995e6624b8c08",
+  "errors": []
+}

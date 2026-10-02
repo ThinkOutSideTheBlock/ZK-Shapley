@@ -1,0 +1,25 @@
+Phase B reweight analyses (Option B alpha path: k1 → k10)
+n_list=[4, 6, 8] n_seeds=40 n_perm=24 lambda_mode=size_scaled
+alpha path: w(a)=(1-a)*w_k1 + a*w_k10
+
+             rho  top1_dis  rank_changed
+n cell                                  
+4 k1    1.000000     0.000         0.000
+  k10   0.890000     0.075         0.475
+  k2    0.980000     0.025         0.050
+  k5    0.940000     0.050         0.225
+6 k1    1.000000     0.000         0.000
+  k10   0.802857     0.450         1.000
+  k2    0.980000     0.100         0.275
+  k5    0.917143     0.300         0.800
+8 k1    1.000000     0.000         0.000
+  k10   0.764881     0.650         0.975
+  k2    0.940476     0.075         0.675
+  k5    0.869048     0.250         0.925
+
+Thresholds:
+   ever_rank_flip  ever_top1_flip
+n                                
+4           0.475           0.075
+6           1.000           0.450
+8           0.975           0.650

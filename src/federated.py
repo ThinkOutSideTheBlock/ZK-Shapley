@@ -1,34 +1,26 @@
 """
-Federated demand forecasting via exact federated ridge regression.
+Exact federated ridge aggregation via additive sufficient statistics.
 
-Design choice (stated explicitly, not hidden): rather than simulating SGD-based
-FedAvg over communication rounds -- which introduces stochastic training noise,
-learning-rate sensitivity, and non-determinism that would contaminate Shapley
-marginal-contribution estimates -- we use the *federated normal equations*
-formulation. For ridge regression, the optimal weight vector is
+Central algebraic fact (plan Section B.2): for coalition S with member
+datasets {(X_i, y_i)}_{i in S}, define
 
-    w* = (X^T X + lambda I)^{-1} X^T y
+    A_i = X_i^T X_i,   b_i = X_i^T y_i,
+    A_S = sum_{i in S} A_i,   b_S = sum_{i in S} b_i,
+    beta_hat_S = (A_S + Lambda)^{-1} b_S.
 
-which is additively separable in per-firm sufficient statistics:
-
-    A_i = X_i^T X_i  (d x d),   b_i = X_i^T y_i  (d,)
-    A_S = sum_{i in S} A_i,      b_S = sum_{i in S} b_i
-    w_S = (A_S + lambda I)^{-1} b_S
-
-This is mathematically *exact*: the federated model trained on coalition S is
-identical to centralizing the raw data of firms in S and running ridge
-regression directly, while only ever transmitting (A_i, b_i) -- not raw demand
-data D_i. This is a well-established efficient FL technique for linear models
-(one-shot / non-iterative federated linear regression) and is the natural
-mechanism to pair with the cryptographic commitment layer (firms commit to and
-prove properties of (A_i, b_i) rather than an iterative gradient stream).
-
-Two direct benefits for this paper's purposes:
-  1. v(S) is deterministic given the data partition -- no stochastic-optimizer
-     confound when computing Shapley values.
-  2. Coalition values for *all* 2^n subsets can be computed by simple matrix
-     summation, making exact Shapley tractable for the validation experiments
-     without retraining 2^n separate models from scratch.
+This is ALGEBRAICALLY IDENTICAL, in exact arithmetic, to fitting centralized
+ridge regression on the pooled raw data of coalition S: stacking every
+member's (X_i, y_i) into (X_S, y_S) gives X_S^T X_S = sum_i X_i^T X_i = A_S
+and X_S^T y_S = sum_i X_i^T y_i = b_S by direct block-matrix expansion, so the
+two normal-equation systems are literally the same linear system. No raw
+observation ever needs to leave a firm's control: each firm need only submit
+(A_i, b_i), a d x d matrix and a length-d vector, regardless of how many rows
+n_i it has. `verify_exact_aggregation` below is the concrete numerical check
+backing the abstract's "bit-identical agreement is additionally verified"
+claim -- floating-point agreement is checked directly against a centralized
+fit, with the caveat (per plan Section H.8) that bitwise identity is an
+implementation-specific result dependent on summation order and linear-
+algebra backend, not a claim about exact arithmetic per se.
 """
 from __future__ import annotations
 
@@ -37,119 +29,159 @@ from dataclasses import dataclass
 
 from .demand import DemandSimulationResult
 
-
-N_LAGS = 3
-N_SEASONAL_FEATURES = 2  # sin, cos
-N_FEATURES = N_LAGS + N_SEASONAL_FEATURES + 1  # +1 intercept
+N_FEATURES_DEFAULT = 8  # informational default; actual dimension is read from data at runtime
+N_FEATURES = N_FEATURES_DEFAULT
 
 
 @dataclass
 class FirmDataset:
-    """Featurized, firm-private train/holdout split. X, y never leave this object's owner."""
+    """
+    One firm's chronologically-split dataset: training rows (used to build
+    sufficient statistics for coalition estimation), validation rows (reserved
+    for hyperparameter selection, e.g. choosing lam), and a holdout evaluation
+    horizon (used for both predictive accuracy and downstream inventory-cost
+    valuation -- plan Section F.1's three-way partition, using the SAME
+    holdout horizon for every coalition within a replication).
+    """
     name: str
     X_train: np.ndarray
     y_train: np.ndarray
+    X_val: np.ndarray
+    y_val: np.ndarray
     X_holdout: np.ndarray
     y_holdout: np.ndarray
+    gamma: float = 0.0
+    sigma: float = 0.0
 
     @property
     def n_train(self) -> int:
-        return self.X_train.shape[0]
+        return int(self.X_train.shape[0])
 
+    @property
+    def n_val(self) -> int:
+        return int(self.X_val.shape[0])
 
-def _build_features(D: np.ndarray, t_index: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Construct supervised-learning features for one-step-ahead demand forecasting:
-    3 autoregressive lags + public seasonal sin/cos features + intercept.
-    Returns (X, y) aligned so that row k predicts D[t_index[k]] from D[t_index[k]-1..3]
-    and the seasonal phase at t_index[k].
-    """
-    rows_X, rows_y = [], []
-    for t in t_index:
-        if t < N_LAGS:
-            continue
-        lags = D[t - N_LAGS:t][::-1]  # most recent lag first
-        phase = 2 * np.pi * t / 7.0
-        seasonal_feats = np.array([np.sin(phase), np.cos(phase)])
-        feat = np.concatenate([[1.0], lags, seasonal_feats])  # intercept + lags + seasonal
-        rows_X.append(feat)
-        rows_y.append(D[t])
-    return np.asarray(rows_X), np.asarray(rows_y)
+    @property
+    def n_holdout(self) -> int:
+        return int(self.X_holdout.shape[0])
 
 
 def build_firm_datasets(
-    sim: DemandSimulationResult,
+    sim_result: DemandSimulationResult,
+    val_fraction: float = 0.15,
     holdout_fraction: float = 0.2,
+    min_holdout: int = 20,
 ) -> dict[str, FirmDataset]:
     """
-    For each firm, build features from its own private trailing window (length
-    firm.n_obs) and split chronologically into train/holdout (no shuffling --
-    this is a time series; shuffling would leak future information into training,
-    a common and serious correctness bug in naive forecasting pipelines).
+    Chronologically split each firm's raw series into train / validation /
+    holdout, in that temporal order (no shuffling -- these are time series and
+    the holdout must represent a genuine out-of-sample future horizon, per
+    plan Section F.1). Enforces a floor of `min_holdout` rows to avoid
+    degenerate evaluation windows for firms with small n_obs under a "severe"
+    sample-size heterogeneity profile.
     """
     datasets: dict[str, FirmDataset] = {}
-    for firm in sim.firms:
-        D = sim.series[firm.name]
-        start = len(D) - firm.n_obs  # firm only "owns" its trailing n_obs window
-        t_index = np.arange(max(start, N_LAGS), len(D))
-        X, y = _build_features(D, t_index)
+    for name, raw in sim_result.firms.items():
+        T = raw.n_obs
+        n_holdout = max(int(round(T * holdout_fraction)), min_holdout)
+        n_holdout = min(n_holdout, T - 10)  # leave at least 10 rows for train+val
+        n_holdout = max(n_holdout, 0)
+        remaining = T - n_holdout
+        n_val = max(int(round(remaining * val_fraction)), 0)
+        n_train = remaining - n_val
 
-        n_holdout = max(int(len(X) * holdout_fraction), 10)
-        X_train, y_train = X[:-n_holdout], y[:-n_holdout]
-        X_holdout, y_holdout = X[-n_holdout:], y[-n_holdout:]
+        X_train = raw.X[:n_train]
+        y_train = raw.y[:n_train]
+        X_val = raw.X[n_train:n_train + n_val]
+        y_val = raw.y[n_train:n_train + n_val]
+        X_holdout = raw.X[n_train + n_val:]
+        y_holdout = raw.y[n_train + n_val:]
 
-        datasets[firm.name] = FirmDataset(
-            name=firm.name, X_train=X_train, y_train=y_train,
-            X_holdout=X_holdout, y_holdout=y_holdout,
+        datasets[name] = FirmDataset(
+            name=name, X_train=X_train, y_train=y_train, X_val=X_val, y_val=y_val,
+            X_holdout=X_holdout, y_holdout=y_holdout, gamma=raw.gamma, sigma=raw.sigma,
         )
     return datasets
-
-
-def sufficient_statistics(ds: FirmDataset) -> tuple[np.ndarray, np.ndarray]:
-    """A_i = X^T X, b_i = X^T y -- the only quantities a firm ever transmits."""
-    A = ds.X_train.T @ ds.X_train
-    b = ds.X_train.T @ ds.y_train
-    return A, b
-
-
-def fit_ridge_from_statistics(A: np.ndarray, b: np.ndarray, lam: float = 1.0) -> np.ndarray:
-    """w* = (A + lambda I)^{-1} b. Uses solve() rather than explicit inversion (numerically stable)."""
-    d = A.shape[0]
-    return np.linalg.solve(A + lam * np.eye(d), b)
 
 
 def aggregate_coalition_statistics(
     datasets: dict[str, FirmDataset], coalition: frozenset[str]
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Sum sufficient statistics over a coalition of firms. Empty coalition -> zero model."""
-    d = N_FEATURES
-    A_sum = np.zeros((d, d))
-    b_sum = np.zeros(d)
+    """
+    Compute A_S = sum_{i in S} X_i^T X_i and b_S = sum_{i in S} X_i^T y_i for
+    the given coalition, using only each member's TRAINING partition. Members
+    outside the coalition contribute nothing (a coalition literally cannot see
+    non-member statistics -- this is the privacy boundary the mechanism is
+    built around).
+    """
+    if len(coalition) == 0:
+        raise ValueError("Cannot aggregate statistics for the empty coalition.")
+    any_name = next(iter(coalition))
+    d = datasets[any_name].X_train.shape[1]
+    A = np.zeros((d, d))
+    b = np.zeros(d)
     for name in coalition:
-        A, b = sufficient_statistics(datasets[name])
-        A_sum += A
-        b_sum += b
-    return A_sum, b_sum
+        X_i = datasets[name].X_train
+        y_i = datasets[name].y_train
+        A += X_i.T @ X_i
+        b += X_i.T @ y_i
+    return A, b
 
 
-def evaluate_holdout_rmse(
-    w: np.ndarray, datasets: dict[str, FirmDataset], eval_firms: frozenset[str]
-) -> float:
+def fit_ridge_from_statistics(A: np.ndarray, b: np.ndarray, lam: float = 1.0) -> np.ndarray:
+    """Solve (A + lam * I) beta = b. This is the exact-aggregation estimator of plan Section B.2."""
+    d = A.shape[0]
+    lhs = A + lam * np.eye(d)
+    return np.linalg.solve(lhs, b)
+
+
+def fit_ridge_centralized(X: np.ndarray, y: np.ndarray, lam: float = 1.0) -> np.ndarray:
+    """Reference centralized ridge fit on pooled raw data, used only by verify_exact_aggregation."""
+    d = X.shape[1]
+    return np.linalg.solve(X.T @ X + lam * np.eye(d), X.T @ y)
+
+
+def verify_exact_aggregation(
+    datasets: dict[str, FirmDataset], coalition: frozenset[str], lam: float = 1.0
+) -> dict[str, float]:
     """
-    Pooled out-of-sample RMSE across eval_firms' private holdout sets, using a
-    model fit on (possibly different) coalition statistics.
+    Numerically verify that the sufficient-statistics route and a centralized
+    fit on pooled raw training rows agree, and report the discrepancy. This is
+    the concrete check backing the abstract's exact-aggregation claim (plan
+    Section B.2); per plan Section H.8, we report a numerical discrepancy
+    rather than asserting bitwise identity as a general property.
     """
-    sq_errors, n_total = [], 0
+    A_S, b_S = aggregate_coalition_statistics(datasets, coalition)
+    w_suffstat = fit_ridge_from_statistics(A_S, b_S, lam=lam)
+
+    X_pooled = np.concatenate([datasets[i].X_train for i in coalition], axis=0)
+    y_pooled = np.concatenate([datasets[i].y_train for i in coalition], axis=0)
+    w_centralized = fit_ridge_centralized(X_pooled, y_pooled, lam=lam)
+
+    max_coef_discrepancy = float(np.max(np.abs(w_suffstat - w_centralized)))
+    rel_discrepancy = max_coef_discrepancy / (float(np.max(np.abs(w_centralized))) + 1e-12)
+
+    return {
+        "max_coefficient_discrepancy": max_coef_discrepancy,
+        "relative_discrepancy": rel_discrepancy,
+        "coalition_size": len(coalition),
+    }
+
+
+def evaluate_holdout_rmse(w: np.ndarray, datasets: dict[str, FirmDataset], eval_firms: frozenset[str]) -> float:
+    """RMSE of predictions X_holdout @ w against y_holdout, pooled across eval_firms."""
+    preds_list, true_list = [], []
     for name in eval_firms:
         ds = datasets[name]
         if ds.X_holdout.shape[0] == 0:
             continue
-        preds = ds.X_holdout @ w
-        sq_errors.append(np.sum((preds - ds.y_holdout) ** 2))
-        n_total += ds.X_holdout.shape[0]
-    if n_total == 0:
+        preds_list.append(ds.X_holdout @ w)
+        true_list.append(ds.y_holdout)
+    if not true_list:
         return float("nan")
-    return float(np.sqrt(np.sum(sq_errors) / n_total))
+    preds = np.concatenate(preds_list)
+    truth = np.concatenate(true_list)
+    return float(np.sqrt(np.mean((preds - truth) ** 2)))
 
 
 def fit_and_evaluate_coalition(
@@ -159,15 +191,12 @@ def fit_and_evaluate_coalition(
     lam: float = 1.0,
 ) -> float:
     """
-    Train a federated ridge model using only train_coalition's sufficient
-    statistics, then evaluate holdout RMSE on eval_firms. This is the core
-    primitive used by both the Shapley value function and the inventory
-    downstream-cost pipeline.
+    Train a federated ridge model on train_coalition's sufficient statistics,
+    then evaluate holdout RMSE on eval_firms. Core primitive shared by the
+    Shapley accuracy-game value function and the inventory-cost pipeline.
     """
     if len(train_coalition) == 0:
-        # Degenerate: no data shared -> predict the per-firm training mean
-        # (autarky baseline -- each firm forecasting with only its own data
-        # collapsed to a constant, i.e. no model at all, the true "v(emptyset)=worst case").
+        # Autarky baseline: no shared model -> predict each firm's own training mean.
         preds_list, true_list = [], []
         for name in eval_firms:
             ds = datasets[name]
@@ -176,11 +205,11 @@ def fit_and_evaluate_coalition(
             mean_pred = ds.y_train.mean() if ds.y_train.shape[0] > 0 else 0.0
             preds_list.append(np.full(ds.X_holdout.shape[0], mean_pred))
             true_list.append(ds.y_holdout)
-        if not preds_list:
+        if not true_list:
             return float("nan")
-        all_preds = np.concatenate(preds_list)
-        all_true = np.concatenate(true_list)
-        return float(np.sqrt(np.mean((all_preds - all_true) ** 2)))
+        preds = np.concatenate(preds_list)
+        truth = np.concatenate(true_list)
+        return float(np.sqrt(np.mean((preds - truth) ** 2)))
 
     A, b = aggregate_coalition_statistics(datasets, train_coalition)
     w = fit_ridge_from_statistics(A, b, lam=lam)

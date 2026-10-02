@@ -1,308 +1,440 @@
 """
-The ZK-Shapley mechanism and baseline payment mechanisms, plus the deviation
-(attack) simulation used to empirically characterize incentive properties.
+ZK-Shapley mechanism, baseline allocation rules, and deviation/attack analyses.
 
-Coalitional value function
----------------------------
-v(S) = u(S) - u(emptyset), where u(S) = -RMSE(model trained on coalition S's
-sufficient statistics, evaluated on the FIXED global holdout set = union of
-all firms' private chronological holdout splits). u is monotone in expectation
-(more correlated-but-noisy data weakly improves out-of-sample accuracy via
-variance reduction -- see demand.py docstring) but not guaranteed monotone
-pointwise on any single finite sample; this is reported, not assumed, via the
-monotonicity-violation-rate diagnostic in experiments/run_main_experiment.py.
+This module is the integration point: it wires demand -> federated ->
+inventory -> shapley into the two coalitional games compared throughout the
+paper (plan Section F.2):
 
-Payment mechanisms compared
-----------------------------
-1. ZK_SHAPLEY (proposed): T_i = phi_i(v), the exact/MC Shapley value of the
-   verified-realized-performance game. Budget-balanced by the efficiency
-   axiom: sum_i T_i = v(N), exactly.
-2. EQUAL_SPLIT (baseline): T_i = v(N) / n. Ignores realized contribution
-   entirely -- the standard naive "everyone gets an equal cut" rule used in
-   many real-world data-pooling consortia. Structurally vulnerable to
-   free-riding (a contributing-nothing firm is paid the same as the top
-   contributor).
-3. PROPORTIONAL_TO_REPORTED_SIZE (baseline): T_i = (n_i_reported / sum_j
-   n_j_reported) * v(N). This is the common "pay by data volume" heuristic.
-   Structurally vulnerable to data-quantity misreporting: n_i_reported is a
-   SELF-REPORTED number with no verification step in this baseline, so a firm
-   can claim more rows than it has and capture a larger share of v(N) without
-   contributing more value. ZK_SHAPLEY has no such attack surface BY
-   CONSTRUCTION, because it never takes any self-reported quantity as an
-   input -- payment depends only on independently verified realized
-   performance.
+    v_operational(S) : inventory-cost SAVINGS from coalition S's pooled
+                        forecast, relative to the no-sharing (autarky)
+                        baseline, evaluated via simulate_serial_supply_chain.
+    v_accuracy(S)     : forecast-loss REDUCTION from coalition S's pooled
+                        ridge model, relative to autarky, evaluated via
+                        evaluate_holdout_rmse.
 
-Deviation (attack) simulation
--------------------------------
-For each firm, we compute payoff under:
-  - HONEST: true statistics submitted.
-  - FREE_RIDE: firm submits all-zero sufficient statistics (zero marginal
-    effort) but still claims protocol membership.
-  - NOISE_INJECTION: firm computes statistics from a deliberately corrupted
-    version of its own training data (label noise injected), i.e. it pays the
-    same effort cost as being honest but degrades the data quality it
-    contributes.
-  - DATA_INFLATION (PROPORTIONAL mechanism only -- structurally inapplicable
-    to ZK_SHAPLEY, which is the point): firm claims a larger n_i_reported than
-    its true row count, with no corresponding increase in actual data.
+Both value functions share the SAME underlying federated ridge machinery and
+differ only in what final scalar they report for a coalition -- exactly the
+"only the characteristic function changes" design constraint from the plan.
 
-This produces an empirical, non-overclaimed characterization of incentive
-robustness: ZK_SHAPLEY weakly dominates the tested deviations for the firm
-under consideration, and is structurally immune to size-misreporting in a way
-the baseline is not -- without asserting a blanket Bayesian-Nash-equilibrium
-theorem over an unbounded strategy space.
+Individual rationality (plan Section C.4, member-relative form): a firm's
+allocation is evaluated against ITS OWN autarky payoff, not zero, since a
+firm's outside option is operating alone (possibly with a nonzero baseline
+inventory cost), not "earning nothing." `apply_participation_costs` and the
+per-mechanism IR check enforce this member-relative notion explicitly.
 """
 from __future__ import annotations
 
-import copy
-from dataclasses import dataclass
-
+import hashlib
 import numpy as np
+from dataclasses import dataclass, field
+from typing import Callable
 
-from .federated import FirmDataset, fit_and_evaluate_coalition
+from .demand import DemandSimulationResult
+from .federated import FirmDataset, fit_and_evaluate_coalition, aggregate_coalition_statistics, fit_ridge_from_statistics
+from .inventory import EchelonConfig, simulate_serial_supply_chain
 from .shapley import CachedGame, exact_shapley, monte_carlo_shapley
-from .commitment import commit, verify, estimate_zk_cost
-
-
-def make_value_function(datasets: dict[str, FirmDataset], lam: float = 1.0):
-    """
-    Returns v: frozenset -> float, normalized so v(emptyset) = 0, where the
-    raw utility u(S) = -RMSE(S) is evaluated on the fixed global holdout
-    (union of all firms' private holdout splits).
-    """
-    all_firms = frozenset(datasets.keys())
-    baseline_rmse = fit_and_evaluate_coalition(datasets, frozenset(), all_firms, lam=lam)
-
-    def v(S: frozenset) -> float:
-        rmse_S = fit_and_evaluate_coalition(datasets, S, all_firms, lam=lam)
-        return baseline_rmse - rmse_S  # utility gain over the no-sharing baseline
-
-    return v, baseline_rmse
 
 
 @dataclass
 class MechanismResult:
-    name: str
+    """
+    Full output of running an allocation mechanism over a fixed set of firms:
+    the per-firm payment/allocation vector, each firm's autarky (standalone)
+    baseline value, member-relative individual-rationality flags, and the
+    grand-coalition value the payments must sum to (efficiency check target).
+    """
     payments: dict[str, float]
-    total_budget: float
-    rmse_grand_coalition: float
-    rmse_baseline: float
+    autarky_baseline: dict[str, float]
+    grand_coalition_value: float
+    ir_satisfied: dict[str, bool]
+    mechanism_name: str
+    metadata: dict = field(default_factory=dict)
 
+    @property
+    def all_ir_satisfied(self) -> bool:
+        return all(self.ir_satisfied.values())
+
+    @property
+    def efficiency_gap(self) -> float:
+        return abs(sum(self.payments.values()) - self.grand_coalition_value)
+
+
+# ---------------------------------------------------------------------------
+# Value function factories
+# ---------------------------------------------------------------------------
+
+def _stable_seed(*parts) -> int:
+    """
+    Process-stable seed derivation.
+
+    Python randomizes str.__hash__ per process unless PYTHONHASHSEED is fixed,
+    so seeding an RNG off hash(name) or hash((coalition, name)) silently
+    produces a DIFFERENT stream on every invocation, defeating the common-
+    random-numbers reproducibility required by plan Section F.1. SHA-256 is
+    stable across processes, platforms, and Python versions.
+    """
+    h = hashlib.sha256()
+    for part in parts:
+        if isinstance(part, (frozenset, set)):
+            h.update(b"|".join(sorted(str(s).encode() for s in part)))
+        else:
+            h.update(str(part).encode())
+        h.update(b"\x00")
+    return int.from_bytes(h.digest()[:8], byteorder="big")
+
+
+def make_operational_value_function(
+    datasets: dict[str, FirmDataset],
+    demand_paths: dict[str, np.ndarray],
+    echelons: list[EchelonConfig],
+    lam: float = 1.0,
+    rng_seed: int = 0,
+) -> Callable[[frozenset[str]], float]:
+    """
+    v_operational(S) = autarky_total_cost(S's members) - coalition_total_cost(S),
+    i.e. inventory-cost SAVINGS relative to each member operating alone,
+    summed over S's members and evaluated with COMMON RANDOM NUMBERS (a fixed
+    rng seed per coalition-member-set, per plan Section F.1) so that
+    differences across coalitions reflect forecast-quality differences only.
+
+    For each member i in S, i's demand is driven by the coalition-S ridge
+    forecast (if |S| > 0) versus i's own autarky ridge forecast, both fed
+    through simulate_serial_supply_chain over member i's holdout demand path.
+    v(emptyset) = 0 by convention (no coalition, no simulated system).
+    """
+    firm_names = list(datasets.keys())
+    _autarky_cache: dict[str, float] = {}
+
+    def _autarky_cost_for_member(name: str) -> float:
+        # Memoized: without this, each firm's autarky simulation is recomputed
+        # once per coalition containing it -- roughly n * 2^(n-1) redundant
+        # multi-echelon simulations across a full exact-Shapley sweep.
+        if name in _autarky_cache:
+            return _autarky_cache[name]
+        rng = np.random.default_rng([rng_seed, _stable_seed("autarky", name)])
+        ds = datasets[name]
+        if ds.X_train.shape[0] == 0 or ds.X_holdout.shape[0] == 0:
+            _autarky_cache[name] = 0.0
+            return 0.0
+        A, b = aggregate_coalition_statistics(datasets, frozenset({name}))
+        w = fit_ridge_from_statistics(A, b, lam=lam)
+        forecast_path = ds.X_holdout @ w
+        residual_std = float(np.std(ds.y_train - ds.X_train @ w)
+                             ) if ds.X_train.shape[0] > 1 else 1.0
+        demand_path = demand_paths[name][-ds.X_holdout.shape[0]:]
+        out = simulate_serial_supply_chain(
+            demand_path, forecast_path, residual_std, echelons, rng=rng)
+        _autarky_cache[name] = out.total_cost
+        return out.total_cost
+
+    def v(coalition: frozenset[str]) -> float:
+        if len(coalition) == 0:
+            return 0.0
+        A_S, b_S = aggregate_coalition_statistics(datasets, coalition)
+        w_S = fit_ridge_from_statistics(A_S, b_S, lam=lam)
+
+        total_savings = 0.0
+        for name in coalition:
+            ds = datasets[name]
+            if ds.X_holdout.shape[0] == 0:
+                continue
+            rng = np.random.default_rng(
+                [rng_seed, _stable_seed(coalition, name)])
+            forecast_path = ds.X_holdout @ w_S
+            residual_std = float(
+                np.std(ds.y_train - ds.X_train @ w_S)) if ds.X_train.shape[0] > 0 else 1.0
+            demand_path = demand_paths[name][-ds.X_holdout.shape[0]:]
+            out = simulate_serial_supply_chain(
+                demand_path, forecast_path, residual_std, echelons, rng=rng)
+            autarky_cost = _autarky_cost_for_member(name)
+            total_savings += (autarky_cost - out.total_cost)
+        return total_savings
+
+    return v
+
+
+def make_accuracy_value_function(
+    datasets: dict[str, FirmDataset], lam: float = 1.0
+) -> Callable[[frozenset[str]], float]:
+    """
+    v_accuracy(S) = sum_{i in S} [autarky_RMSE_i - coalition_RMSE(S on i)],
+    where autarky_RMSE_i is the firm’s own singleton ridge model.
+    This guarantees v({i}) = 0 by construction (plan Section F.2 / model_spec).
+    """
+    def v(coalition: frozenset[str]) -> float:
+        if len(coalition) == 0:
+            return 0.0
+        total_reduction = 0.0
+        for name in coalition:
+            # Singleton baseline (own model) — NOT the empty-coalition mean
+            autarky_rmse = fit_and_evaluate_coalition(
+                datasets, frozenset({name}), frozenset({name}), lam=lam)
+            coalition_rmse = fit_and_evaluate_coalition(
+                datasets, coalition, frozenset({name}), lam=lam)
+            if np.isnan(autarky_rmse) or np.isnan(coalition_rmse):
+                continue
+            total_reduction += (autarky_rmse - coalition_rmse)
+        return total_reduction
+    return v
+
+
+# ---------------------------------------------------------------------------
+# Individual rationality (member-relative)
+# ---------------------------------------------------------------------------
+
+def _member_relative_ir_check(
+    payments: dict[str, float], autarky_baseline: dict[str, float], tol: float = 1e-9
+) -> dict[str, bool]:
+    """
+    Member-relative IR: firm i's allocation is compared to i's own autarky
+    VALUE-FUNCTION baseline (i.e. v({i}), which by construction of both
+    v_operational and v_accuracy above is 0 -- since both are already defined
+    as savings/reduction RELATIVE to autarky). IR here means payments[i] >= 0,
+    i.e. no firm is asked to pay to join relative to its own outside option of
+    operating alone with cost/RMSE = autarky_baseline[i].
+    """
+    return {name: (payments.get(name, 0.0) >= autarky_baseline.get(name, 0.0) - tol) for name in payments}
+
+
+def apply_participation_costs(
+    payments: dict[str, float], participation_costs: dict[str, float]
+) -> tuple[dict[str, float], dict[str, bool]]:
+    """
+    Net a per-firm participation cost (e.g. commitment-protocol overhead,
+    computational cost of producing sufficient statistics) against gross
+    Shapley payments, and re-check member-relative IR against the NET payoff
+    (net_i = payments[i] - participation_costs[i] >= 0). This operationalizes
+    the plan's requirement that IR be checked net of any real cost the
+    mechanism itself imposes on participants, not just gross of it.
+    """
+    net_payments = {
+        name: payments[name] - participation_costs.get(name, 0.0) for name in payments}
+    ir_net = {name: net_payments[name] >= -1e-9 for name in net_payments}
+    return net_payments, ir_net
+
+
+# ---------------------------------------------------------------------------
+# Mechanisms
+# ---------------------------------------------------------------------------
 
 def run_zk_shapley_mechanism(
-    datasets: dict[str, FirmDataset],
-    lam: float = 1.0,
+    firm_names: list[str],
+    v_func: Callable[[frozenset[str]], float],
     exact: bool = True,
-    mc_permutations: int = 2000,
-    mc_seed: int = 0,
-    verify_commitments: bool = True,
-) -> tuple[MechanismResult, dict]:
+    n_permutations: int = 2000,
+    rng: np.random.Generator | None = None,
+) -> MechanismResult:
     """
-    Full protocol simulation: (1) each firm computes sufficient statistics and
-    commits to them, (2) commitments are revealed and verified (binding check
-    -- catches any post-hoc tampering), (3) the smart-contract-equivalent
-    computes v(S) from verified statistics for the Shapley calculation, (4)
-    payments are issued. Returns the mechanism result plus a diagnostics dict
-    (commitment verification outcomes, ZK cost estimate, Shapley computation
-    cost in terms of characteristic-function evaluations).
+    The paper's core mechanism: allocate v(N) via Shapley value of the
+    coalitional game (v_func, firm_names). Uses exact enumeration for
+    n <= 12 firms (tractable, per plan Section F.1), Monte Carlo permutation
+    sampling otherwise.
     """
-    rng = np.random.default_rng(mc_seed)
-    firms = list(datasets.keys())
-
-    # --- (1)+(2): commit-reveal round, one commitment per firm to its sufficient statistics ---
-    from .federated import sufficient_statistics
-    commitments, revealed_ok = {}, {}
-    total_train_rows = 0
-    for name in firms:
-        A, b = sufficient_statistics(datasets[name])
-        c = commit(A, b, rng=rng)
-        commitments[name] = c
-        if verify_commitments:
-            revealed_ok[name] = verify(c, A, b)
-        total_train_rows += datasets[name].n_train
-    assert all(revealed_ok.values()) if verify_commitments else True, "Commitment verification failed"
-
-    # --- (3): characteristic function + Shapley computation ---
-    v, baseline_rmse = make_value_function(datasets, lam=lam)
-    game = CachedGame(firms, v)
-
-    if exact and len(firms) <= 12:
+    game = CachedGame(players=firm_names, v_func=v_func)
+    if exact and len(firm_names) <= 12:
         phi = exact_shapley(game)
-        mc_diag = None
     else:
-        phi, mc_diag = monte_carlo_shapley(game, n_permutations=mc_permutations, seed=mc_seed)
+        phi = monte_carlo_shapley(game, n_permutations=n_permutations, rng=rng)
 
-    rmse_grand = fit_and_evaluate_coalition(datasets, frozenset(firms), frozenset(firms), lam=lam)
-    total_budget = sum(phi.values())
+    autarky_baseline = {name: game.v(frozenset({name})) for name in firm_names}
+    v_grand = game.v(frozenset(firm_names))
+    ir = _member_relative_ir_check(phi, autarky_baseline)
 
-    result = MechanismResult(
-        name="ZK_SHAPLEY",
-        payments=phi,
-        total_budget=total_budget,
-        rmse_grand_coalition=rmse_grand,
-        rmse_baseline=baseline_rmse,
-    )
-
-    # average ZK cost estimate across firms, using each firm's true row count
-    from .federated import N_FEATURES
-    zk_costs = {name: estimate_zk_cost(datasets[name].n_train, N_FEATURES) for name in firms}
-
-    diagnostics = {
-        "commitments_verified": revealed_ok,
-        "n_characteristic_function_evaluations": game.n_evaluations,
-        "monte_carlo_diagnostics": mc_diag,
-        "zk_cost_per_firm": zk_costs,
-        "total_train_rows": total_train_rows,
-    }
-    return result, diagnostics
-
-
-def run_equal_split_mechanism(datasets: dict[str, FirmDataset], lam: float = 1.0) -> MechanismResult:
-    """Baseline: split the grand-coalition surplus equally regardless of contribution."""
-    firms = list(datasets.keys())
-    v, baseline_rmse = make_value_function(datasets, lam=lam)
-    v_N = v(frozenset(firms))
-    payments = {name: v_N / len(firms) for name in firms}
-    rmse_grand = fit_and_evaluate_coalition(datasets, frozenset(firms), frozenset(firms), lam=lam)
     return MechanismResult(
-        name="EQUAL_SPLIT", payments=payments, total_budget=sum(payments.values()),
-        rmse_grand_coalition=rmse_grand, rmse_baseline=baseline_rmse,
+        payments=phi, autarky_baseline=autarky_baseline, grand_coalition_value=v_grand,
+        ir_satisfied=ir, mechanism_name="ZK-Shapley (exact)" if exact and len(firm_names) <= 12
+        else "ZK-Shapley (Monte Carlo)",
+        metadata={"n_permutations": n_permutations if not (
+            exact and len(firm_names) <= 12) else None},
     )
+
+
+def run_accuracy_shapley_mechanism(
+    firm_names: list[str], v_accuracy_func: Callable[[frozenset[str]], float],
+    exact: bool = True, n_permutations: int = 2000, rng: np.random.Generator | None = None,
+) -> MechanismResult:
+    """Identical Shapley machinery applied to the accuracy game -- the head-to-head comparator."""
+    result = run_zk_shapley_mechanism(
+        firm_names, v_accuracy_func, exact=exact, n_permutations=n_permutations, rng=rng)
+    result.mechanism_name = "Federated Shapley Value (accuracy-based)" + \
+        result.mechanism_name.split("ZK-Shapley")[-1]
+    return result
+
+
+def run_equal_split_mechanism(
+    firm_names: list[str], v_func: Callable[[frozenset[str]], float]
+) -> MechanismResult:
+    """Baseline: split v(N) equally regardless of contribution."""
+    game = CachedGame(players=firm_names, v_func=v_func)
+    v_grand = game.v(frozenset(firm_names))
+    n = len(firm_names)
+    payments = {name: v_grand / n for name in firm_names}
+    autarky_baseline = {name: game.v(frozenset({name})) for name in firm_names}
+    ir = _member_relative_ir_check(payments, autarky_baseline)
+    return MechanismResult(payments=payments, autarky_baseline=autarky_baseline, grand_coalition_value=v_grand,
+                           ir_satisfied=ir, mechanism_name="Equal Split")
 
 
 def run_proportional_mechanism(
-    datasets: dict[str, FirmDataset],
-    lam: float = 1.0,
-    reported_sizes: dict[str, int] | None = None,
+    firm_names: list[str], v_func: Callable[[frozenset[str]], float], size_proxy: dict[str, float]
 ) -> MechanismResult:
     """
-    Baseline: split the grand-coalition surplus proportionally to SELF-REPORTED
-    sample counts. If `reported_sizes` is None, uses true counts (the honest
-    case); pass an inflated dict to simulate the data-inflation attack.
+    Baseline: split v(N) proportionally to a size proxy (e.g. declared sample
+    count) -- the contrasting mechanism used alongside sample_size_baseline_payment
+    in theory.py to make Proposition A's content legible.
     """
-    firms = list(datasets.keys())
-    v, baseline_rmse = make_value_function(datasets, lam=lam)
-    v_N = v(frozenset(firms))
-    sizes = reported_sizes or {name: datasets[name].n_train for name in firms}
-    total = sum(sizes.values())
-    payments = {name: (sizes[name] / total) * v_N for name in firms}
-    rmse_grand = fit_and_evaluate_coalition(datasets, frozenset(firms), frozenset(firms), lam=lam)
-    return MechanismResult(
-        name="PROPORTIONAL", payments=payments, total_budget=sum(payments.values()),
-        rmse_grand_coalition=rmse_grand, rmse_baseline=baseline_rmse,
-    )
+    game = CachedGame(players=firm_names, v_func=v_func)
+    v_grand = game.v(frozenset(firm_names))
+    total = sum(size_proxy[name] for name in firm_names)
+    payments = {name: v_grand * size_proxy[name] / total for name in firm_names} if total > 0 else \
+        {name: v_grand / len(firm_names) for name in firm_names}
+    autarky_baseline = {name: game.v(frozenset({name})) for name in firm_names}
+    ir = _member_relative_ir_check(payments, autarky_baseline)
+    return MechanismResult(payments=payments, autarky_baseline=autarky_baseline, grand_coalition_value=v_grand,
+                           ir_satisfied=ir, mechanism_name="Proportional (size-weighted)")
 
 
-def run_no_sharing_baseline(datasets: dict[str, FirmDataset], lam: float = 1.0) -> MechanismResult:
-    """Baseline: no federation at all. Zero payments; reported for the RMSE/cost comparison only."""
-    firms = list(datasets.keys())
-    _, baseline_rmse = make_value_function(datasets, lam=lam)
-    return MechanismResult(
-        name="NO_SHARING", payments={name: 0.0 for name in firms}, total_budget=0.0,
-        rmse_grand_coalition=baseline_rmse, rmse_baseline=baseline_rmse,
-    )
+def run_no_sharing_baseline(firm_names: list[str], v_func: Callable[[frozenset[str]], float]) -> MechanismResult:
+    """
+    Baseline: no coalition forms at all -- every firm gets its own autarky
+    value (0 by construction of v_operational/v_accuracy's savings/reduction
+    definition). Serves as the "genuine collaboration gains exist" check:
+    if v(N) via any real mechanism is not reliably > 0, pooling is not adding
+    value and the whole exercise is moot (plan Section F.1 sanity check).
+    """
+    game = CachedGame(players=firm_names, v_func=v_func)
+    payments = {name: game.v(frozenset({name})) for name in firm_names}
+    autarky_baseline = dict(payments)
+    v_grand = game.v(frozenset(firm_names))
+    ir = _member_relative_ir_check(payments, autarky_baseline)
+    return MechanismResult(payments=payments, autarky_baseline=autarky_baseline, grand_coalition_value=v_grand,
+                           ir_satisfied=ir, mechanism_name="No Sharing (autarky)")
 
 
 # ---------------------------------------------------------------------------
-# Deviation (attack) simulation
+# Deviation / attack analyses
 # ---------------------------------------------------------------------------
 
-def free_ride_dataset(ds: FirmDataset) -> FirmDataset:
+def scale_statistics_attack(
+    A_i: np.ndarray, b_i: np.ndarray, scale_factor: float
+) -> tuple[np.ndarray, np.ndarray]:
     """
-    Firm contributes zero-effort: all-zero training rows (still correctly shaped).
-
-    Empirical note (verified in experiments/run_main_experiment.py, Experiment
-    3): under ZK_SHAPLEY this typically yields a NEGATIVE payment, not merely
-    a zero payment. This is a correct, non-obvious consequence of the value
-    function, not an artifact: when the free-riding firm is the sole member
-    of a coalition (the "going first" case in the Shapley permutation sum),
-    training a model on all-zero sufficient statistics collapses to the
-    trivial zero-weight predictor (every demand forecast = 0), which performs
-    far WORSE on the held-out evaluation set than the no-coalition autarky
-    baseline (each firm predicting its own historical mean). Since the
-    all-zero contribution is actively harmful in that scenario (and neutral,
-    i.e. zero marginal contribution, in every other coalition the firm could
-    join), the Shapley-weighted average payoff is pulled negative. This
-    strengthens rather than weakens the incentive argument: free-riding is
-    not merely unrewarded under ZK_SHAPLEY, it is penalized in expectation.
+    A genuine data-fabrication attack: a firm submits (alpha * A_i, alpha *
+    b_i) for some alpha != 1, i.e. fabricated sufficient statistics
+    inconsistent with any real dataset the firm actually holds (since real
+    A_i, b_i are rank-tied to actual observation counts and cannot generally
+    be rescaled this way while remaining realizable by any (X, y)). THIS
+    ATTACK IS EXPECTED, AND REQUIRED BY THE PLAN, TO CHANGE PAYMENTS -- it is
+    fundamentally different from, and must not be conflated with, the
+    standalone-declared-size invariance tested by Proposition A / plan Section
+    F.4. Use this function together with mechanism-level payment computation
+    to empirically characterize HOW payments move under fabrication, which
+    then motivates why a future proof layer (costed but not built,
+    proof_cost.py) would need to constrain (A_i, b_i) to be relation-
+    consistent with a committed raw dataset.
     """
-    zeroed = copy.deepcopy(ds)
-    zeroed.X_train = np.zeros_like(ds.X_train)
-    zeroed.y_train = np.zeros_like(ds.y_train)
-    return zeroed
+    return scale_factor * A_i, scale_factor * b_i
 
 
-def inject_noise_dataset(ds: FirmDataset, noise_std_multiplier: float, seed: int) -> FirmDataset:
-    """
-    Firm submits statistics computed from its OWN real feature rows but with
-    labels corrupted by additive Gaussian noise scaled relative to the
-    in-sample label standard deviation -- modeling a firm that puts in the
-    same nominal "effort" (real data, real computation, a valid ZK proof of
-    correct computation over THAT corrupted data) but degrades signal quality,
-    e.g. to deny competitors full benefit while still claiming participation credit.
-    """
-    rng = np.random.default_rng(seed)
-    corrupted = copy.deepcopy(ds)
-    label_std = ds.y_train.std() if ds.y_train.shape[0] > 0 else 1.0
-    noise = rng.normal(0.0, noise_std_multiplier * label_std, size=ds.y_train.shape)
-    corrupted.y_train = ds.y_train + noise
-    return corrupted
+def inject_noise_dataset(
+    y: np.ndarray, sigma_eta: float, rng: np.random.Generator
+) -> np.ndarray:
+    """Contaminate a response vector with independent, mean-zero Gaussian noise (the empirical counterpart to theory.noise_injection_risk_bound)."""
+    return y + rng.normal(0.0, sigma_eta, size=y.shape[0])
 
 
 def deviation_payoff_analysis(
+    firm_names: list[str],
+    v_func_factory: Callable[[dict[str, FirmDataset]], Callable[[frozenset[str]], float]],
     datasets: dict[str, FirmDataset],
-    target_firm: str,
-    lam: float = 1.0,
-    noise_std_multiplier: float = 2.0,
-    inflation_factor: float = 3.0,
+    deviator: str,
+    sigma_eta_grid: list[float],
+    n_mc_reps: int = 20,
     seed: int = 0,
 ) -> dict:
     """
-    For `target_firm`, compute ZK_SHAPLEY and PROPORTIONAL payoffs under
-    HONEST, FREE_RIDE, NOISE_INJECTION, and (proportional-mechanism-only)
-    DATA_INFLATION deviations, holding all other firms' behavior fixed at
-    honest. This is the core empirical evidence for the paper's incentive
-    analysis section.
+    Empirical Monte Carlo sweep: for each sigma_eta in sigma_eta_grid,
+    contaminate `deviator`'s TRAINING response vector with independent noise
+    of that scale (holding all other firms' data fixed and truthful),
+    recompute the deviator's ZK-Shapley payment under the resulting
+    coalitional game, and average over n_mc_reps independent noise draws.
+    Reports the payment trajectory in sigma_eta and whether it is (on
+    average, empirically) non-increasing -- the empirical counterpart to
+    theory.noise_injection_risk_bound's analytic guarantee, per plan Section
+    F.5's requirement to pair the analytic bound with an empirical sweep
+    rather than resting the claim on the analytic result alone.
     """
-    results = {}
+    rng = np.random.default_rng(seed)
+    mean_payments = []
+    std_payments = []
 
-    # HONEST baseline for both mechanisms
-    zk_honest, _ = run_zk_shapley_mechanism(datasets, lam=lam, mc_seed=seed)
-    prop_honest = run_proportional_mechanism(datasets, lam=lam)
-    results["honest"] = {
-        "zk_shapley_payment": zk_honest.payments[target_firm],
-        "proportional_payment": prop_honest.payments[target_firm],
+    for sigma_eta in sigma_eta_grid:
+        rep_payments = []
+        for _ in range(n_mc_reps):
+            contaminated = dict(datasets)
+            if sigma_eta > 0:
+                ds = datasets[deviator]
+                noisy_y_train = inject_noise_dataset(
+                    ds.y_train, sigma_eta, rng)
+                contaminated[deviator] = FirmDataset(
+                    name=ds.name, X_train=ds.X_train, y_train=noisy_y_train,
+                    X_val=ds.X_val, y_val=ds.y_val, X_holdout=ds.X_holdout, y_holdout=ds.y_holdout,
+                    gamma=ds.gamma, sigma=ds.sigma,
+                )
+            v_func = v_func_factory(contaminated)
+            result = run_zk_shapley_mechanism(
+                firm_names, v_func, exact=(len(firm_names) <= 12))
+            rep_payments.append(result.payments[deviator])
+        mean_payments.append(float(np.mean(rep_payments)))
+        std_payments.append(float(np.std(rep_payments)))
+
+    diffs = np.diff(mean_payments)
+    empirically_non_increasing = bool(np.all(diffs <= 1e-6))
+
+    return {
+        "sigma_eta_grid": sigma_eta_grid,
+        "mean_payments": mean_payments,
+        "std_payments": std_payments,
+        "empirically_non_increasing": empirically_non_increasing,
+        "n_mc_reps": n_mc_reps,
+        "deviator": deviator,
     }
 
-    # FREE_RIDE: replace target firm's dataset with zero-effort data
-    ds_freeride = copy.deepcopy(datasets)
-    ds_freeride[target_firm] = free_ride_dataset(datasets[target_firm])
-    zk_fr, _ = run_zk_shapley_mechanism(ds_freeride, lam=lam, mc_seed=seed)
-    prop_fr = run_proportional_mechanism(ds_freeride, lam=lam)
-    results["free_ride"] = {
-        "zk_shapley_payment": zk_fr.payments[target_firm],
-        "proportional_payment": prop_fr.payments[target_firm],
-    }
 
-    # NOISE_INJECTION: corrupt target firm's labels
-    ds_noisy = copy.deepcopy(datasets)
-    ds_noisy[target_firm] = inject_noise_dataset(datasets[target_firm], noise_std_multiplier, seed)
-    zk_noisy, _ = run_zk_shapley_mechanism(ds_noisy, lam=lam, mc_seed=seed)
-    prop_noisy = run_proportional_mechanism(ds_noisy, lam=lam)
-    results["noise_injection"] = {
-        "zk_shapley_payment": zk_noisy.payments[target_firm],
-        "proportional_payment": prop_noisy.payments[target_firm],
-    }
+def compute_divergence_metrics(
+    payments_operational: dict[str, float], payments_accuracy: dict[str, float]
+) -> dict:
+    """
+    Quantify how much the operational (inventory-cost) and accuracy-based
+    Shapley allocations diverge for the head-to-head comparison (plan Section
+    F.2): rank-order (Spearman-style via simple rank comparison) agreement,
+    max absolute normalized payment difference, and per-firm rank shifts.
+    """
+    firms = sorted(payments_operational.keys())
+    op_vals = np.array([payments_operational[f] for f in firms])
+    acc_vals = np.array([payments_accuracy[f] for f in firms])
 
-    # DATA_INFLATION: only meaningful for PROPORTIONAL (ZK_SHAPLEY takes no
-    # self-reported size input at all -- this row is intentionally absent
-    # from the zk_shapley column to make the structural point explicit).
-    inflated_sizes = {name: datasets[name].n_train for name in datasets}
-    inflated_sizes[target_firm] = int(inflated_sizes[target_firm] * inflation_factor)
-    prop_inflated = run_proportional_mechanism(datasets, lam=lam, reported_sizes=inflated_sizes)
-    results["data_inflation"] = {
-        "zk_shapley_payment": None,  # structurally not applicable -- no size input exists to inflate
-        "proportional_payment": prop_inflated.payments[target_firm],
-    }
+    op_ranks = op_vals.argsort().argsort()
+    acc_ranks = acc_vals.argsort().argsort()
+    rank_shifts = {f: int(op_ranks[i] - acc_ranks[i])
+                   for i, f in enumerate(firms)}
 
-    return results
+    n = len(firms)
+    if n > 1:
+        d_sq = np.sum((op_ranks - acc_ranks) ** 2)
+        spearman_rho = 1 - (6 * d_sq) / (n * (n ** 2 - 1))
+    else:
+        spearman_rho = float("nan")
+
+    op_total = np.sum(np.abs(op_vals)) + 1e-12
+    acc_total = np.sum(np.abs(acc_vals)) + 1e-12
+    normalized_diff = np.abs(op_vals / op_total - acc_vals / acc_total)
+
+    return {
+        "firms": firms,
+        "spearman_rho": float(spearman_rho),
+        "rank_shifts": rank_shifts,
+        "max_normalized_payment_difference": float(np.max(normalized_diff)),
+        "mean_normalized_payment_difference": float(np.mean(normalized_diff)),
+        "any_rank_reversal": any(v != 0 for v in rank_shifts.values()),
+    }

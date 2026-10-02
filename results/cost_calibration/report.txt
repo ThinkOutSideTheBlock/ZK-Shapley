@@ -1,0 +1,7 @@
+Cost calibration
+Weights use τ = cb/(ch+cb), w = (ch+cb) φ(z_τ) √(L+1), L=1.
+Paper cells k1–k10 induce moderate κ_eff at n=4 (~1–3); larger n may change κ slightly via extra primitives.
+Reference ladder is pedagogical only.
+
+Locked Regime A: rank(wΔσ)=rank(ΔC) under ideal newsvendor-style probe.
+Locked R1 boundary: residual-weighted vs path-cost ranks not equivalent (k1 mean ρ ≈ -0.59).

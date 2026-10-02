@@ -1,0 +1,16 @@
+λ-robustness
+n=4 n_seeds=30 lam0=1.0
+Canonical: size_scaled. Comparator: fixed.
+
+lambda_mode cell  kappa_mean  rho_mean  rho_std  rho_median  top1_mean  n_seeds
+      fixed   k1    1.000000  1.000000 0.000000         1.0   0.000000       30
+      fixed   k2    1.340211  0.946667 0.089955         1.0   0.066667       30
+      fixed   k5    1.989486  0.926667 0.098027         1.0   0.133333       30
+      fixed  k10    2.941675  0.813333 0.216131         0.8   0.233333       30
+size_scaled   k1    1.000000  1.000000 0.000000         1.0   0.000000       30
+size_scaled   k2    1.340211  0.973333 0.114269         1.0   0.033333       30
+size_scaled   k5    1.989486  0.933333 0.160459         1.0   0.066667       30
+size_scaled  k10    2.941675  0.886667 0.163440         1.0   0.100000       30
+
+Expect: qualitative decline of rho with kappa under BOTH modes.
+Do not require identical rho levels across modes.

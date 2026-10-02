@@ -1,0 +1,59 @@
+IR source: results/ir_core_diagnostics/results.csv
+
+=== cell=k1  n=30 ===
+  p_neg_vN_res: 0.4333
+  mean_vN_res: 0.0273
+  mean_vN_res_if_pos: 0.1405
+  mean_vN_res_if_neg: -0.1207
+  p_neg_vN_acc: 0.6333
+  mean_vN_acc: -0.0308
+  mean_frac_ir_res: 0.5917
+  rate_all_ir_res: 0.2333
+  mean_frac_ir_acc: 0.4500
+  rate_all_ir_acc: 0.0333
+  rate_all_ir_res | vN>=0: 0.4118 (n_pos=17)
+  note: when vN<0, all-IR is impossible under efficiency (n_neg=13).
+
+=== cell=k2  n=30 ===
+  p_neg_vN_res: 0.2667
+  mean_vN_res: 0.0614
+  mean_vN_res_if_pos: 0.1222
+  mean_vN_res_if_neg: -0.1058
+  p_neg_vN_acc: 0.6333
+  mean_vN_acc: -0.0308
+  mean_frac_ir_res: 0.6417
+  rate_all_ir_res: 0.2667
+  mean_frac_ir_acc: 0.4500
+  rate_all_ir_acc: 0.0333
+  rate_all_ir_res | vN>=0: 0.3636 (n_pos=22)
+  note: when vN<0, all-IR is impossible under efficiency (n_neg=8).
+
+=== cell=k5  n=30 ===
+  p_neg_vN_res: 0.2333
+  mean_vN_res: 0.1327
+  mean_vN_res_if_pos: 0.2261
+  mean_vN_res_if_neg: -0.1742
+  p_neg_vN_acc: 0.6333
+  mean_vN_acc: -0.0308
+  mean_frac_ir_res: 0.6750
+  rate_all_ir_res: 0.3333
+  mean_frac_ir_acc: 0.4500
+  rate_all_ir_acc: 0.0333
+  rate_all_ir_res | vN>=0: 0.4348 (n_pos=23)
+  note: when vN<0, all-IR is impossible under efficiency (n_neg=7).
+
+A4 source: results/A4_negative_vN/results.csv
+=== lambda_mode=fixed ===
+  P(v_path<0)=0.267  mean=82.8378
+  P(v_acc<0)=0.100  mean=0.0769
+  P(v_resid<0)=0.167  mean=0.0994
+
+=== lambda_mode=size_scaled ===
+  P(v_path<0)=0.267  mean=83.8383
+  P(v_acc<0)=0.300  mean=0.0444
+  P(v_resid<0)=0.100  mean=0.1307
+
+
+=== PAPER PARAGRAPH (paste) ===
+\paragraph{Negative coalition value.}
+In the IR diagnostic grid ($n=4$, 30 seeds per cost cell), the grand-coalition value under residual-weighted and unweighted residual games is negative in a non-trivial fraction of replications (k1: $P(v_N^{\mathrm{res}}<0)\approx 0.43$; $P(v_N^{\mathrm{acc}}<0)\approx 0.63$; k2: $P(v_N^{\mathrm{res}}<0)\approx 0.27$; $P(v_N^{\mathrm{acc}}<0)\approx 0.63$; k5: $P(v_N^{\mathrm{res}}<0)\approx 0.23$; $P(v_N^{\mathrm{acc}}<0)\approx 0.63$). When $v(N)<0$, efficiency implies that not all Shapley payments can be nonnegative, so all-IR is impossible in those seeds by accounting identity. Conditional on $v(N)\ge 0$, all-IR still fails in a substantial share of seeds (Table~\ref{tab:ir}), indicating that negativity is not the only obstacle to IR. Mechanically, residual reductions $\Delta\sigma_i(S)$ can be negative for some firms when size-scaled ridge shrinkage or omitted common-factor variation makes the coalition fit worse on a firm's validation segment than autarky; the characteristic function then need not be nonnegative. We therefore treat IR as an empirical property of the realized game and, for deployment, recommend IR projection or participation only when $v(N)>0$.

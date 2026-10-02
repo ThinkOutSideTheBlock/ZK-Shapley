@@ -1,0 +1,6 @@
+kappa_1: mean ρ=-0.030  median=-0.100  reversal=nan
+kappa_2: mean ρ=0.080  median=0.200  reversal=nan
+kappa_5: mean ρ=0.150  median=0.200  reversal=nan
+kappa_10: mean ρ=0.150  median=0.300  reversal=nan
+
+elapsed=29.0s

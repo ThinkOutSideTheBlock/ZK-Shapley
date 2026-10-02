@@ -1,0 +1,28 @@
+{
+  "param_grid": {
+    "n_firms": [
+      3
+    ],
+    "shared_factor_correlation": [
+      0.6
+    ],
+    "cb_over_ch": [
+      9.0
+    ],
+    "n_periods": [
+      100
+    ],
+    "n_features": [
+      4
+    ]
+  },
+  "n_seeds": 5,
+  "master_seed": 0,
+  "n_configs": 1,
+  "n_runs_attempted": 5,
+  "n_rows": 90,
+  "wall_time_seconds": 0.43628578800007745,
+  "git_sha": "da082775c3b98c655677e62e3c29256f941e9bb5",
+  "config_hash": "a1ae0b52674c2a9e",
+  "errors": []
+}

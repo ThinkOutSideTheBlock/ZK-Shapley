@@ -1,0 +1,12 @@
+Benchmark consistency
+
+Regime A (ideal): see regime_a_scaling.csv, regime_a_ranking.csv
+  Expect: ratio C/(wσ) roughly stable across σ; rank(wΔσ)=rank(ΔC).
+
+Regime B (federated residual vs path-cost ranks):
+cell  kappa_eff  rho_phi_mean  rho_phi_std  rho_phi_median   l1_mean  l1_median  p_neg_vN_path  p_neg_vN_res  mean_vN_path  mean_vN_res  max_eff_gap_res  max_eff_gap_path  n_seeds
+  k1   1.000000     -0.586667     0.416664            -0.8 21.471272  21.944462       0.733333      0.033333    -35.925519     0.669852     1.110223e-16      2.842171e-14       30
+  k2   1.340211     -0.593333     0.303921            -0.7 15.282437  14.252687       0.600000      0.033333     -6.670593     0.540125     1.110223e-16      7.105427e-15       30
+  k5   1.989486     -0.466667     0.455869            -0.4 15.701607  12.657360       0.400000      0.133333     19.197528     0.428473     1.110223e-16      2.842171e-14       30
+
+Interpretation: under Lemma assumptions weighting matches cost scaling/ranks; under the finite-horizon forecast-driven DGP, residual-weighted Shapley ranks need not match path-cost ranks (R1 k1 mean ρ ≈ -0.59).

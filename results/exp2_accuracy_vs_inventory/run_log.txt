@@ -1,0 +1,3 @@
+wall_time_seconds: 10.09
+rows: 9900
+errors: 0
